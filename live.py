@@ -1,0 +1,720 @@
+"""Live stream (RTMP) for groups / channels where the self owner is an admin.
+
+`.لایو شروع [شبکه یا لینک]` creates a Telegram live (RTMP) in the current group/channel and relays a
+satellite / international channel (default: Iran International) or any link into it with ffmpeg.
+
+How it works (Telegram's own RTMP live):
+  phone.createGroupCall(rtmp_stream=True)  ->  phone.getGroupCallStreamRtmpUrl()  ->  url + key
+  ffmpeg  <source>  ->  flv  ->  url/key
+The video is copied when it is already H.264 (very light on the server); otherwise (or when a quality is chosen)
+it is re-encoded with libx264. The stream key is sent only to the owner's Saved Messages.
+"""
+import asyncio
+import collections
+import logging
+import os
+import random
+import re
+import shutil
+import time
+
+from telethon import errors, functions, types
+
+import db
+import utils
+
+log = logging.getLogger("live")
+Z = "‌"
+LIVE_MAX = int(os.environ.get("LIVE_MAX", "5") or 5)          # how many lives may run on this server at once
+
+# name -> (display name, YouTube search query, words that must appear in the channel name)
+PRESETS = {
+    "اینترنشنال": ("📡 ایران اینترنشنال", "Iran International live", ("iran international", "iranintl", "ایران اینترنشنال"),
+                   ("iran international", "iranintl", "iran intl")),
+    "بی_بی_سی": ("📡 بی‌بی‌سی فارسی", "BBC Persian live", ("bbc",), ("bbc persian", "bbc farsi", "bbc news persian", "bbc news farsi")),
+    "من_و_تو": ("📡 من و تو", "Manoto live", ("manoto", "من و تو"), ("manoto",)),
+    "صدای_آمریکا": ("📡 صدای آمریکا (VOA فارسی)", "VOA Persian live", ("voa", "voice of america", "صدای آمریکا"),
+                    ("voa persian", "voa farsi", "voa dari", "irinn")),
+    "یورونیوز": ("📡 یورونیوز فارسی", "Euronews Persian live", ("euronews",), ("euronews persian", "euronews farsi")),
+}
+# known direct streams (tried first; dead ones are skipped automatically). Add your own with LIVE_EXTRA="preset=url,..."
+STATIC = {"اینترنشنال": [("Iran International", "https://dev-live.livetvstream.co.uk/LS-63503-4/index.m3u8")]}
+for _kv in (os.environ.get("LIVE_EXTRA") or "").split(","):
+    if "=" in _kv:
+        _k, _u = _kv.split("=", 1)
+        STATIC.setdefault(_k.strip(), []).append((_k.strip(), _u.strip()))
+VLC_UA = {"User-Agent": "VLC/3.0.20 LibVLC/3.0.20"}
+_PL_ERRS: list = []
+
+# IPTV playlists searched first: direct HLS links do not go through YouTube (which blocks datacenter IPs).
+# Override with LIVE_PLAYLISTS="url1,url2" (M3U lists).
+PLAYLISTS = [u.strip() for u in (os.environ.get("LIVE_PLAYLISTS") or
+             "https://iptv-org.github.io/iptv/countries/ir.m3u,https://iptv-org.github.io/iptv/languages/fas.m3u,https://iptv-org.github.io/iptv/categories/news.m3u").split(",") if u.strip()]
+ALIAS = {"ایران_اینترنشنال": "اینترنشنال", "iranintl": "اینترنشنال", "iran_international": "اینترنشنال", "ایران_اینترنشنال_تی_وی": "اینترنشنال",
+         "bbc": "بی_بی_سی", "بی‌بی‌سی": "بی_بی_سی", "بیبیسی": "بی_بی_سی", "bbc_persian": "بی_بی_سی",
+         "manoto": "من_و_تو", "منوتو": "من_و_تو", "من_وتو": "من_و_تو",
+         "voa": "صدای_آمریکا", "صدای_امریکا": "صدای_آمریکا", "euronews": "یورونیوز"}
+DEFAULT = "اینترنشنال"
+QUALITY = {"اصلی": None, "کپی": None, "original": None, "copy": None,
+           "360": (360, 700), "480": (480, 1200), "720": (720, 2500), "1080": (1080, 4500)}
+
+_lives: dict = {}            # uid -> state dict
+
+
+def _n(w):
+    return re.sub(r"[\s‌]+", "_", (w or "").replace("ي", "ی").replace("ك", "ک").strip()).lower()
+
+
+def _ffmpeg():
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def ffmpeg_kind():
+    """'system' (apt/nix ffmpeg, dynamic) or 'static' (imageio's bundled build - can segfault on DNS in some containers)."""
+    return "system" if shutil.which("ffmpeg") else "static"
+
+
+def pick_preset(word):
+    k = _n(word)
+    k = ALIAS.get(k, k)
+    return k if k in PRESETS else None
+
+
+def is_direct(url):
+    if re.search(r"\.m3u(\?|$)", url, re.I):
+        return False                                             # playlist of channels, handled in resolve_source
+    return bool(re.match(r"^(rtmps?|rtsp|udp|srt)://", url, re.I) or re.search(r"\.(m3u8|mpd|ts|mp4|flv)(\?|$)", url, re.I))
+
+
+# ------------------------------------------------------------------ source resolving (blocking -> run in a thread)
+_COOKIE_FILE = None
+
+
+def _cookie_file():
+    """Optional: YT_COOKIES (Netscape cookies.txt content) lets yt-dlp pass YouTube's bot check on datacenter IPs."""
+    global _COOKIE_FILE
+    txt = os.environ.get("YT_COOKIES", "")
+    if not txt:
+        return None
+    if _COOKIE_FILE is None:
+        import tempfile
+        fd, p = tempfile.mkstemp(suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write(txt.replace("\\n", "\n"))
+        _COOKIE_FILE = p
+    return _COOKIE_FILE
+
+
+def _ydl(opts=None):
+    import yt_dlp
+    o = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, "socket_timeout": 25,
+         "ignore_no_formats_error": True, "check_formats": False}
+    if os.environ.get("LIVE_PROXY"):
+        o["proxy"] = os.environ["LIVE_PROXY"]
+    ck = _cookie_file()
+    if ck:
+        o["cookiefile"] = ck
+    o.update(opts or {})
+    return yt_dlp.YoutubeDL(o)
+
+
+# YouTube clients that return HLS manifests for live streams without needing JS challenges, tried in order
+_CLIENTS = (["web_safari"], ["tv"], ["android_vr"], ["mweb"], ["ios"], None)
+
+
+_PAGE_CACHE: dict = {}          # preset -> (time, page url)   (skips the slow search on the next start)
+
+
+def _find_live_url(query, words):
+    """Search YouTube with the *Live* filter for a currently live video whose channel name matches `words`."""
+    from urllib.parse import quote_plus
+    urls = (f"https://www.youtube.com/results?search_query={quote_plus(query)}&sp=EgJAAQ%253D%253D",   # filter: Live
+            f"ytsearch12:{query}")
+    for u in urls:
+        try:
+            with _ydl({"extract_flat": True, "playlistend": 15}) as y:
+                res = y.extract_info(u, download=False)
+        except Exception as ex:                                  # noqa: BLE001
+            log.warning("live search failed (%s): %s", u[:30], str(ex)[:120])
+            continue
+        cands = []
+        for it in (res or {}).get("entries") or []:
+            ch = ((it.get("channel") or it.get("uploader") or "") + " " + (it.get("title") or "")).lower()
+            if any(w in ch for w in words):
+                cands.append(it)
+        cands.sort(key=lambda i: 0 if i.get("live_status") == "is_live" else 1)
+        for it in cands[:3]:
+            if it.get("live_status") in ("is_live", None):
+                return it.get("url") or f"https://www.youtube.com/watch?v={it.get('id')}"
+    return None
+
+
+def pick_media(info):
+    """Choose what ffmpeg should read from a yt-dlp info dict -> (media, headers). media = url or [video_url, audio_url]."""
+    fm = [f for f in (info.get("formats") or []) if f.get("url")]
+    hdr = info.get("http_headers") or {}
+
+    def h(f):
+        return f.get("height") or 0
+
+    def has(f, k):
+        return (f.get(k) or "none") != "none"
+    muxed = [f for f in fm if has(f, "vcodec") and has(f, "acodec") and h(f) <= 1080]
+    hls = [f for f in muxed if "m3u8" in (f.get("protocol") or "")]
+    for pool in (hls, muxed):                                    # live HLS first, then any muxed file
+        if pool:
+            best = max(pool, key=h)
+            return best["url"], best.get("http_headers") or hdr
+    vid = [f for f in fm if has(f, "vcodec") and not has(f, "acodec") and h(f) <= 1080]
+    aud = [f for f in fm if has(f, "acodec") and not has(f, "vcodec")]
+    if vid and aud:                                              # separate tracks: ffmpeg muxes them
+        return [max(vid, key=h)["url"], max(aud, key=lambda f: f.get("abr") or 0)["url"]], hdr
+    if info.get("manifest_url"):
+        return info["manifest_url"], hdr
+    if info.get("url"):
+        return info["url"], hdr
+    return None, hdr
+
+
+def _probe(media, headers):
+    """Download the first bytes of the real media (HLS: newest segment) with the same headers ffmpeg will use.
+    Raises on 403/404 so a client whose links are blocked (PO token / IP) is skipped before ffmpeg starts."""
+    import urllib.request
+    from urllib.parse import urljoin
+    hd = {k: v for k, v in (headers or {}).items() if k.lower() in ("user-agent", "referer", "origin", "cookie", "accept-language")}
+    hd.setdefault("User-Agent", "Mozilla/5.0")
+
+    def get(u, n=400000):
+        with urllib.request.urlopen(urllib.request.Request(u, headers=hd), timeout=15) as r:
+            return r.read(n)
+    for m in (media if isinstance(media, (list, tuple)) else [media]):
+        if not m.startswith("http"):
+            continue
+        if ".m3u8" not in m and "manifest" not in m:
+            get(m, 2048)
+            continue
+        txt = get(m).decode("utf-8", "ignore")
+        for _ in range(2):                                       # master -> media playlist
+            if "#EXT-X-STREAM-INF" not in txt:
+                break
+            lines = txt.splitlines()
+            var = None
+            for i, ln in enumerate(lines):
+                if ln.startswith("#EXT-X-STREAM-INF"):
+                    var = next((x for x in lines[i + 1:] if x and not x.startswith("#")), None)
+                    break
+            if not var:
+                break
+            m = urljoin(m, var)
+            txt = get(m).decode("utf-8", "ignore")
+        segs = [x for x in txt.splitlines() if x and not x.startswith("#")]
+        if not segs:
+            raise RuntimeError("playlist بدون سگمنت")
+        get(urljoin(m, segs[-1]), 2048)
+
+
+def _extract(page):
+    errs = []
+    for strict in (True, False):                                 # strict = real YouTube error text; then the tolerant pass
+        for cl in _CLIENTS:
+            opts = {"extractor_args": {"youtube": {"player_client": cl}}} if cl else {}
+            if strict:
+                opts["ignore_no_formats_error"] = False
+            try:
+                with _ydl(opts) as y:
+                    info = y.extract_info(page, download=False)
+                if info and info.get("_type") == "playlist":
+                    info = (info.get("entries") or [None])[0] or {}
+                media, hdr = pick_media(info or {})
+                if media:
+                    try:
+                        _probe(media, hdr)
+                    except Exception as pe:                      # noqa: BLE001
+                        errs.append(f"{(cl or ['default'])[0]}: لینک بلاک ({str(pe)[:60]})")
+                        continue
+                    return media, hdr, (info.get("title") or "")
+                errs.append(f"{(cl or ['default'])[0]}: بدون فرمت")
+            except Exception as ex:                              # noqa: BLE001
+                m = re.sub(r"\x1b\[[0-9;]*m|ERROR:\s*|\[youtube\]\s*[\w-]+:\s*", "", str(ex)).strip()
+                errs.append(f"{(cl or ['default'])[0]}: {m[:90]}")
+        if strict and errs:
+            log.warning("live source strict pass failed: %s", " || ".join(errs)[:600])
+    uniq = []
+    for x in errs:
+        k = x.split(": ", 1)[-1]
+        if k not in [u.split(": ", 1)[-1] for u in uniq]:
+            uniq.append(x)
+    raise RuntimeError(" | ".join(uniq[:3])[:300] or "هیچ فرمت قابل پخشی پیدا نشد")
+
+
+_PL_CACHE: dict = {}            # playlist url -> (time, [(name, url)])
+
+
+def _playlist(url):
+    hit = _PL_CACHE.get(url)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    import urllib.request
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=20) as r:
+        txt = r.read(12_000_000).decode("utf-8", "ignore")
+    items, name = [], ""
+    for ln in txt.splitlines():
+        ln = ln.strip()
+        if ln.startswith("#EXTINF"):
+            name = ln.rsplit(",", 1)[-1].strip()
+        elif ln and not ln.startswith("#") and re.match(r"^(https?|rtmps?)://", ln, re.I):
+            items.append((name, ln))
+            name = ""
+    _PL_CACHE[url] = (time.time(), items)
+    return items
+
+
+def _is_youtube(u):
+    return bool(re.search(r"(youtube\.com|youtu\.be)", u, re.I))
+
+
+def _from_playlists(words):
+    """Candidate links for a channel from the IPTV playlists: direct streams first, YouTube links last."""
+    out = []
+    for pl in PLAYLISTS:
+        try:
+            for name, u in _playlist(pl):
+                if any(w in name.lower() for w in words) and u not in [x[1] for x in out]:
+                    out.append((name, u))
+        except Exception as ex:                                  # noqa: BLE001
+            log.warning("live playlist %s failed: %s", pl[:50], str(ex)[:100])
+            _PL_ERRS.append(f"{pl.rsplit('/', 1)[-1]}: {type(ex).__name__}")
+    out.sort(key=lambda x: _is_youtube(x[1]))
+    return out
+
+
+def _first_working(cands, limit=8):
+    """Probe direct candidates in parallel; return the first (in list order) that really serves data."""
+    from concurrent.futures import ThreadPoolExecutor
+    direct = [(n, u) for n, u in cands if not _is_youtube(u)][:limit]
+    if not direct:
+        return None
+
+    def ok(item):
+        try:
+            _probe(item[1], VLC_UA)
+            return True
+        except Exception:                                        # noqa: BLE001
+            return False
+    with ThreadPoolExecutor(max_workers=min(8, len(direct))) as ex:
+        res = list(ex.map(ok, direct))
+    for item, good in zip(direct, res):
+        if good:
+            return item
+    return None
+
+
+def resolve_source(src):
+    """-> (media url or [video, audio], headers dict, title). `src` is a preset key or a link."""
+    title = ""
+    notes = []
+    if src in PRESETS:
+        name, query, words, plwords = PRESETS[src]
+        _PL_ERRS.clear()
+        cands = list(STATIC.get(src, [])) + _from_playlists(plwords)
+        cands.sort(key=lambda x: _is_youtube(x[1]))
+        good = _first_working(cands)
+        if good:
+            return good[1], dict(VLC_UA), name
+        if _PL_ERRS:
+            notes.append("پلی‌لیست: " + "، ".join(_PL_ERRS[:3]))
+        yt_from_pl = next((u for _n, u in cands if _is_youtube(u)), None)
+        if cands:
+            notes.append(f"{len(cands)} لینک پلی‌لیست مرده بود")
+        hit = _PAGE_CACHE.get(src)
+        page = hit[1] if hit and time.time() - hit[0] < 1800 else None
+        if not page:
+            page = yt_from_pl or _find_live_url(query, words)
+            if not page:
+                raise RuntimeError("الان لایو زنده‌ای از این شبکه پیدا نشد" + (f" ({'، '.join(notes)})" if notes else ""))
+            _PAGE_CACHE[src] = (time.time(), page)
+        title = name
+    else:
+        page = src
+        if re.search(r"\.m3u(\?|$)", page, re.I):               # an M3U playlist link: first working channel in it
+            items = _playlist(page)
+            good = _first_working(items, 12)
+            if good:
+                return good[1], dict(VLC_UA), (good[0] or "")[:60]
+            page = next((u for _n, u in items if _is_youtube(u)), None)
+            if not page:
+                raise RuntimeError("هیچ لینک کارکننده‌ای توی این پلی‌لیست نبود")
+        elif is_direct(page):
+            return page, {}, src[:60]
+    try:
+        media, hdr, t = _extract(page)
+    except Exception as ex:
+        _PAGE_CACHE.pop(src, None)
+        raise RuntimeError(str(ex) + (f" | {'، '.join(notes)}" if notes else "")) from ex
+    return media, hdr, title or t[:60]
+
+
+# ------------------------------------------------------------------ ffmpeg
+def build_cmd(ff, media, headers, rtmp, quality, force_encode=False):
+    cmd = [ff, "-hide_banner", "-nostdin", "-loglevel", "warning", "-nostats", "-progress", "pipe:1", "-stats_period", "1"]
+    medias = media if isinstance(media, (list, tuple)) else [media]
+    for m in medias:
+        if re.match(r"^https?://", m, re.I):
+            hdr = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items() if k.lower() in ("user-agent", "referer", "cookie", "origin"))
+            if hdr:
+                cmd += ["-headers", hdr]
+            cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        hls = bool(re.search(r"m3u8|manifest", m, re.I))
+        cmd += (["-fflags", "+nobuffer+genpts", "-analyzeduration", "1500000", "-probesize", "1500000", "-live_start_index", "-2"] if hls else
+                [] if re.match(r"^rtmps?://", m, re.I) else ["-re"]) + ["-i", m]
+    cmd += ["-map", "0:v:0?", "-map", "1:a:0?" if len(medias) > 1 else "0:a:0?"]
+    q = QUALITY.get(quality) if quality else None
+    if q or force_encode:
+        h, kbps = q or (480, 1200)
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-profile:v", "main", "-pix_fmt", "yuv420p",
+                "-vf", f"scale=-2:{h}", "-r", "25", "-g", "50", "-keyint_min", "50", "-sc_threshold", "0",
+                "-b:v", f"{kbps}k", "-maxrate", f"{int(kbps * 1.2)}k", "-bufsize", f"{kbps * 2}k"]
+    else:
+        cmd += ["-c:v", "copy"]
+    cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-f", "flv", rtmp]
+    return cmd
+
+
+async def _supervisor(c, uid, st):
+    """Keeps ffmpeg alive: re-resolves the source on every restart (links expire), falls back to re-encoding."""
+    ff = _ffmpeg()
+    fails = 0
+    force = False
+    try:
+        while not st["stop"]:
+            try:
+                pre = st.pop("pre", None)                                # already resolved by .لایو شروع -> no second lookup
+                media, headers, title = pre or await asyncio.to_thread(resolve_source, st["src"])
+                st["title"] = title or st["title"]
+            except Exception as ex:                                  # noqa: BLE001
+                fails += 1
+                st["error"] = f"منبع: {str(ex)[:100]}"
+                if fails >= 6:
+                    break
+                await asyncio.sleep(10)
+                continue
+            cmd = build_cmd(ff, media, headers, st["rtmp"], st["quality"], force)
+            t0 = time.time()
+            proc = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            st["proc"] = proc
+            st["encode"] = force or bool(QUALITY.get(st["quality"] or ""))
+            st["log"].clear()
+
+            async def read_err():
+                async for line in proc.stderr:
+                    t = line.decode("utf-8", "ignore").strip()
+                    if t:
+                        st["log"].append(t[:200])
+                        log.warning("ffmpeg[%s]: %s", uid, t[:200])
+
+            async def read_prog():
+                async for line in proc.stdout:
+                    t = line.decode("utf-8", "ignore").strip()
+                    if t.startswith(("total_size=", "out_time=", "speed=", "bitrate=")):
+                        k, _, v = t.partition("=")
+                        st["prog"][k] = v
+
+            async def watchdog():
+                last, since = -1, time.time()
+                while proc.returncode is None:
+                    await asyncio.sleep(5)
+                    cur = _sent_bytes(st)
+                    if cur != last:
+                        last, since = cur, time.time()
+                    elif time.time() - since > 45:               # nothing sent for 45 s (403 / dead link) -> restart with a fresh link
+                        st["log"].append("بدون خروجی ۴۵ ثانیه؛ ریستارت با لینک تازه")
+                        try:
+                            proc.terminate()
+                        except ProcessLookupError:
+                            pass
+                        return
+
+            rt = [asyncio.create_task(read_err()), asyncio.create_task(read_prog()), asyncio.create_task(watchdog())]
+            await proc.wait()
+            await asyncio.gather(*rt, return_exceptions=True)
+            err = " | ".join(st["log"]).encode()
+            if st["stop"]:
+                break
+            ran = time.time() - t0
+            st["error"] = err.decode("utf-8", "ignore")[-300:].strip()
+            if proc.returncode == -11:
+                fails += 3                                              # segfault: retrying will not help
+            if ran < 30:
+                fails += 1
+                txt = " ".join(st["log"])
+                if (not force and not st["encode"] and proc.returncode != -11
+                        and re.search(r"codec|not supported|unsupported|header|invalid data|flv", txt, re.I)
+                        and not re.search(r"403|forbidden|server returned|404", txt, re.I)):
+                    force = True                                      # copy failed because of the codec -> re-encode
+            else:
+                fails = 0
+            if fails >= 6:
+                break
+            await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        p = st.get("proc")
+        if p and p.returncode is None:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+    if not st["stop"]:                                                # gave up by itself
+        st["dead"] = True
+        try:
+            await c.send_message("me", f"⚠️ لایوی {st['chat_title']} قطع شد و بعد از چند تلاش وصل نشد.\n{st.get('error', '')}")
+        except Exception:                                            # noqa: BLE001
+            pass
+
+
+# ------------------------------------------------------------------ Telegram side
+def _call_of(res):
+    for u in getattr(res, "updates", None) or []:
+        call = getattr(u, "call", None)
+        if call is not None and hasattr(call, "access_hash"):
+            return types.InputGroupCall(id=call.id, access_hash=call.access_hash)
+    return None
+
+
+async def _rtmp(c, peer):
+    try:
+        r = await c(functions.phone.GetGroupCallStreamRtmpUrlRequest(peer=peer, revoke=False))
+    except TypeError:
+        r = await c(functions.phone.GetGroupCallStreamRtmpUrlRequest(peer=peer))
+    url = r.url if r.url.endswith("/") else r.url + "/"
+    return url + r.key, r.url, r.key
+
+
+def _sent_bytes(st):
+    v = (st.get("prog") or {}).get("total_size", "0")
+    return int(v) if str(v).isdigit() else 0
+
+
+def _diag(st):
+    p = st.get("proc")
+    alive = p is not None and p.returncode is None
+    pr = st.get("prog") or {}
+    line = (f"ffmpeg[{ffmpeg_kind()}] {'روشن' if alive else 'خاموش (کد ' + str(getattr(p, 'returncode', '?')) + ')'}"
+            f" | ارسال‌شده: {_sent_bytes(st) // 1024} KB | سرعت: {pr.get('speed', '-')}")
+    if getattr(p, "returncode", None) == -11:
+        line += ("\n💥 ffmpeg کرش کرد (SIGSEGV)؛ معمولاً یعنی ffmpegِ استاتیکِ همراه برنامه روی این سرور کار نمی‌کنه. "
+                 "ffmpeg سیستمی نصب کن: توی Variables ریلوی `RAILPACK_DEPLOY_APT_PACKAGES=ffmpeg` و `NIXPACKS_APT_PKGS=ffmpeg` رو بذار و Redeploy بزن.")
+    last = list(st.get("log") or [])[-3:]
+    if last:
+        line += "\nخطای ffmpeg: " + " | ".join(last)
+    elif st.get("error"):
+        line += "\n" + st["error"][:200]
+    return line
+
+
+def _fmt_dur(s):
+    s = int(s)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def help_text():
+    names = "\n".join(f"• `{k}` ← {v[0]}" for k, v in PRESETS.items())
+    return ("📡 **لایو ماهواره‌ای**\n"
+            "توی گروه یا کانالی که **ادمینی** لایو می‌سازه و تصویر شبکه رو بهش وصل می‌کنه.\n\n"
+            "`.لایو شروع` ← پیش‌فرض: ایران اینترنشنال\n"
+            "`.لایو شروع بی_بی_سی` | `.لایو شروع https://...` (لینک یوتیوب، m3u8، ...)\n"
+            "`.لایو منبع من_و_تو` ← عوض کردن شبکه وقتی لایو روشنه\n"
+            "`.لایو کیفیت 720` (۳۶۰ | ۴۸۰ | ۷۲۰ | ۱۰۸۰ | اصلی)\n"
+            "`.لایو وضعیت` | `.لایو کلید` (آدرس و کلید RTMP توی پیام‌های ذخیره‌شده) | `.لایو توقف`\n\n"
+            f"شبکه‌ها:\n{names}\n\n"
+            "⚠️ برای کانال/ابرگروه لازمه؛ گروه معمولی اول باید به ابرگروه تبدیل بشه. پخش‌کردن محتوای شبکه‌ها مسئولیتش با خودته.")
+
+
+async def c_live(c, e, uid, arg):
+    a = (arg or "").strip()
+    parts = a.split(None, 1)
+    sub = _n(parts[0]) if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if sub in ("", "راهنما", "help"):
+        return await e.edit(help_text())
+    if sub in ("شروع", "start", "روشن", "on"):
+        return await _start(c, e, uid, rest)
+    if sub in ("توقف", "stop", "خاموش", "off", "پایان"):
+        return await _stop_cmd(c, e, uid)
+    if sub in ("وضعیت", "status"):
+        return await _status(e, uid)
+    if sub in ("کلید", "key", "rtmp"):
+        st = _lives.get(uid)
+        if not st:
+            return await e.edit("لایوی روشن نیست")
+        await c.send_message("me", f"🔑 **RTMP لایوی {st['chat_title']}**\n`{st['url']}`\nکلید: `{st['key']}`\n(برای OBS؛ جایی پخش نکن)")
+        return await e.edit("🔑 آدرس و کلید رو توی پیام‌های ذخیره‌شده‌ات فرستادم")
+    if sub in ("کیفیت", "quality"):
+        q = _n(utils.to_en_digits(rest))
+        if q not in QUALITY:
+            return await e.edit("کیفیت: `360` | `480` | `720` | `1080` | `اصلی`")
+        await db.uset(uid, "live_q", "" if QUALITY[q] is None else q)
+        st = _lives.get(uid)
+        if st:
+            st["quality"] = "" if QUALITY[q] is None else q
+            await _restart_ff(st)
+        return await e.edit(f"🎞 کیفیت لایو: **{rest}**" + (" (اعمال شد)" if st else ""))
+    if sub in ("منبع", "source", "شبکه"):
+        st = _lives.get(uid)
+        if not st:
+            return await e.edit("لایوی روشن نیست؛ اول `.لایو شروع`")
+        src = pick_preset(rest) or (rest if rest.startswith(("http", "rtmp", "rtsp", "udp", "srt")) else None)
+        if not src:
+            return await e.edit("شبکه یا لینک معتبر بده؛ `.لایو` رو بزن تا لیست رو ببینی")
+        if re.search(r"rtmp\.t\.me|/s/\d+:", src):
+            return await e.edit("⚠️ این آدرس مقصد لایوئه نه منبع؛ شبکه یا لینک ویدیو بده")
+        st["src"] = src
+        await _restart_ff(st)
+        return await e.edit(f"🔁 منبع عوض شد: **{PRESETS[src][0] if src in PRESETS else src[:50]}**")
+    # `.لایو اینترنشنال` etc. = shortcut for start
+    if pick_preset(a) or a.startswith("http"):
+        return await _start(c, e, uid, a)
+    await e.edit(help_text())
+
+
+async def _restart_ff(st):
+    p = st.get("proc")
+    if p and p.returncode is None:
+        try:
+            p.terminate()
+        except ProcessLookupError:
+            pass
+
+
+async def _start(c, e, uid, rest):
+    if e.is_private:
+        return await e.edit("📡 لایو رو توی یه گروه یا کانال بزن (جایی که ادمینی)")
+    if uid in _lives and not _lives[uid].get("dead"):
+        return await e.edit(f"یه لایو روشن داری ({_lives[uid]['chat_title']}). اول `.لایو توقف`")
+    if len([s for s in _lives.values() if not s.get("dead")]) >= LIVE_MAX and uid not in db.ADMINS:
+        return await e.edit("⏳ ظرفیت لایوهای سرور پره؛ چند دقیقه‌ی دیگه امتحان کن")
+    if not _ffmpeg():
+        return await e.edit("⚠️ ffmpeg روی سرور نیست")
+    if ffmpeg_kind() == "static":
+        log.warning("live: using the bundled static ffmpeg (system ffmpeg recommended)")
+    src = DEFAULT
+    if rest:
+        src = pick_preset(rest) or (rest if rest.startswith(("http", "rtmp", "rtsp", "udp", "srt")) else None)
+        if not src:
+            return await e.edit("شبکه یا لینک معتبر بده؛ `.لایو` رو بزن تا لیست رو ببینی")
+    ent = await e.get_chat()
+    if isinstance(ent, types.Chat):
+        return await e.edit("⚠️ این یه گروه معمولیه؛ لایو RTMP فقط برای ابرگروه و کانال کار می‌کنه (گروه رو به ابرگروه تبدیل کن)")
+    if re.search(r"rtmp\.t\.me|/s/\d+:", src):
+        return await e.edit("⚠️ این آدرس، **مقصد** لایوئه (جایی که تلگرام تصویر رو می‌گیره) نه منبع.\n"
+                            "منبع باید شبکه یا لینک ویدیو باشه: `.لایو شروع` (اینترنشنال) | `.لایو شروع بی_بی_سی` | `.لایو شروع https://.../index.m3u8`")
+    await e.edit("🔎 در حال پیدا کردن منبع و ساخت لایو...")
+    peer = await e.get_input_chat()
+    chat_title = getattr(ent, "title", None) or str(e.chat_id)
+
+    async def make_call():
+        r = await c(functions.phone.CreateGroupCallRequest(peer=peer, random_id=random.getrandbits(31), rtmp_stream=True,
+                                                           title=("📡 " + (PRESETS[src][0].replace("📡 ", "") if src in PRESETS else "Live"))[:60]))
+        call_ = _call_of(r)
+        return call_, await _rtmp(c, peer)
+
+    # source lookup and Telegram live creation run at the same time (about half the start-up time)
+    r_src, r_call = await asyncio.gather(asyncio.to_thread(resolve_source, src), make_call(), return_exceptions=True)
+    if isinstance(r_src, Exception):
+        if not isinstance(r_call, Exception):
+            try:
+                await c(functions.phone.DiscardGroupCallRequest(call=r_call[0]))
+            except Exception:                                    # noqa: BLE001
+                pass
+        m = str(r_src)
+        hint = ("\n(یوتیوب IP سرور رو به‌عنوان ربات می‌شناسه؛ متغیر YT_COOKIES یا LIVE_PROXY رو تنظیم کن یا لینک مستقیم m3u8 بده)"
+                if re.search(r"sign in|not a bot|429|403|بلاک", m, re.I) else "")
+        return await e.edit(f"⚠️ منبع در دسترس نیست: {m[:320]}{hint}")
+    if isinstance(r_call, Exception):
+        ex = r_call
+        if isinstance(ex, errors.ChatAdminRequiredError):
+            return await e.edit("⛔ برای ساخت لایو باید ادمین با دسترسی «مدیریت چت‌های ویدیویی» باشی")
+        msg = type(ex).__name__
+        if "GROUPCALL" in msg.upper() or "ALREADY" in msg.upper():
+            return await e.edit("⚠️ یه چت صوتی/ویدیویی یا لایو دیگه توی این چت روشنه؛ اول تمومش کن")
+        return await e.edit(f"⚠️ ساخت لایو ناموفق بود ({msg})")
+    media_pre = r_src
+    title = r_src[2]
+    call, (full, url, key) = r_call
+    st = {"chat_id": e.chat_id, "chat_title": chat_title, "call": call, "peer": peer, "src": src, "rtmp": full, "url": url, "key": key,
+          "quality": await db.uget(uid, "live_q", "") or "", "started": time.time(), "stop": False, "title": title, "error": "", "proc": None,
+          "log": collections.deque(maxlen=8), "prog": {}, "pre": media_pre}
+    _lives[uid] = st
+    st["task"] = asyncio.create_task(_supervisor(c, uid, st))
+    asyncio.create_task(c.send_message("me", f"🔑 **RTMP لایوی {chat_title}** (فقط برای OBS؛ داخل `.لایو شروع` نذار)\n`{url}`\nکلید: `{key}`"))
+    sent = False
+    for _ in range(50):                                           # up to ~25 s: wait until bytes really flow to Telegram
+        await asyncio.sleep(0.5)
+        p = st.get("proc")
+        if p is not None and p.returncode is None and _sent_bytes(st) > 30000:
+            sent = True
+            break
+    head = "🔴 **لایو شروع شد و داره پخش میشه!**" if sent else "🟡 **لایو ساخته شد ولی هنوز تصویری به تلگرام نرسیده**"
+    tail = "" if sent else ("\n" + _diag(st) + "\nچند ثانیه صبر کن؛ اگه نیومد `.لایو وضعیت` بزن و متنش رو بفرست.")
+    await e.edit(f"{head}\n📺 {title or src[:40]}\n💬 {chat_title}{tail}\n`.لایو وضعیت` | `.لایو توقف`")
+
+
+async def _status(e, uid):
+    st = _lives.get(uid)
+    if not st:
+        return await e.edit("⚪ لایوی روشن نیست")
+    p = st.get("proc")
+    alive = p is not None and p.returncode is None
+    await e.edit(f"{'🔴 زنده' if alive and not st.get('dead') else '🟡 در حال اتصال/قطع'}\n💬 {st['chat_title']}\n📺 {st.get('title') or st['src'][:40]}\n"
+                 f"⏱ {_fmt_dur(time.time() - st['started'])}\n🎞 {'بازکدگذاری ' + (st['quality'] or '480') + 'p' if st.get('encode') else 'کپی مستقیم (بدون افت کیفیت)'}"
+                 + f"\n📤 {_diag(st)}")
+
+
+async def _stop_cmd(c, e, uid):
+    if uid not in _lives:
+        return await e.edit("⚪ لایوی روشن نیست")
+    await stop(c, uid)
+    await e.edit("⏹ لایو تموم شد")
+
+
+async def stop(c, uid):
+    st = _lives.pop(uid, None)
+    if not st:
+        return
+    st["stop"] = True
+    p = st.get("proc")
+    if p and p.returncode is None:
+        try:
+            p.terminate()
+        except ProcessLookupError:
+            pass
+    t = st.get("task")
+    if t:
+        t.cancel()
+    if st.get("call") is not None and c is not None:
+        try:
+            await c(functions.phone.DiscardGroupCallRequest(call=st["call"]))
+        except Exception as ex:                                      # noqa: BLE001
+            log.warning("discard call failed: %s", ex)
+
+
+async def stop_all(uid, c=None):
+    """Called when the self stops / diamonds run out."""
+    await stop(c, uid)
+
+
+COMMAND_NAMES = {"لایو": ("live", c_live), "پخش_زنده": ("live", c_live)}
+
+
+def install(COMMANDS, FA):
+    for name, (key, fn) in COMMAND_NAMES.items():
+        COMMANDS[key] = fn
+        FA[name] = key
