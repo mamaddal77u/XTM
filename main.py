@@ -811,7 +811,7 @@ _pv_cool: dict[int, float] = {}
 
 
 async def clockpic_view(uid, path, mk, back_path):
-    """🖼 clock drawn on the profile photo: on/off, 9 colors, 29 designs, interval, preview."""
+    """🖼 clock drawn on the profile photo: on/off, 9 colors, 27 designs, interval, preview."""
     c = selfbot.clients.get(uid)
     if not c:
         return None
@@ -850,14 +850,14 @@ async def clockpic_view(uid, path, mk, back_path):
             except Exception:
                 log.exception("clockpic preview failed")
                 note = "\n⚠️ پیش‌نمایش ساخته نشد"
-        elif act == "va":                                                   # all 5 poster designs, one album
+        elif act == "va":                                                   # the 3 artwork designs, one album
             if time.time() - _pv_cool.get(uid, 0) < 12:
                 note = "\n⏳ چند ثانیه صبر کن و دوباره بزن"
             else:
                 _pv_cool[uid] = time.time()
                 try:
                     await selfbot.cpic_get_base(c, uid, capture=not (await selfbot.cpic_cfg(uid))["on"])
-                    keys = [k for k, _n in clockpic.STYLES if k.startswith("poster")]
+                    keys = [k for k, _n in clockpic.STYLES if k.startswith("art_")]
                     files = []
                     for k in keys:
                         b = io.BytesIO(await selfbot.cpic_render(c, uid, style=k))
@@ -878,14 +878,14 @@ async def clockpic_view(uid, path, mk, back_path):
     rows.append([B(f"هر {n} دقیقه" + (" ✓" if n == cfg["every"] else ""), mk(f"ki:e:{n}"), G if n == cfg["every"] else R)
                  for n in selfbot.CPIC_EVERY])
     rows.append([B("🔄 تغییر پروفایل اصلی", mk("ki:b"), G)])
-    rows.append([B("🖼 پیش‌نمایش پوسترها (۵ طرح)", mk("ki:va"), G)])
+    rows.append([B("🖼 پیش‌نمایش ۳ پوستر ۱۸|۱۹", mk("ki:va"), G)])
     rows.append([B("👁 پیش‌نمایش", mk("ki:v"), G), B("بازگشت", mk("k"), R)])
     st = dict(clockpic.STYLES)[cfg["style"]]
     text = ("<b>🖼 ساعت روی عکس پروفایل</b>\n"
             f"وضعیت: {'🟢 روشن' if cfg['on'] else '🔴 خاموش'} | طرح: <b>{st}</b> | رنگ: <b>{clockpic.COLORS[cfg['color']][0]}</b> | هر <b>{cfg['every']}</b> دقیقه\n"
             "<blockquote>ساعت روی همون عکس پروفایل فعلی‌ات کشیده میشه؛ هر چند دقیقه عکس جدید جایگزین قبلی میشه و عکس‌های اصلیت دست‌نخورده می‌مونن. "
             "با خاموش کردن، عکس قبلیت برمی‌گرده.\n🔄 پروفایلت رو عوض کردی؟ اول عکس جدید رو توی تلگرام بذار، بعد «تغییر پروفایل اصلی» رو بزن تا ساعت روی اون بیاد "
-            "(موقع روشن کردن هم خودکار آخرین پروفایلت برداشته میشه). عکس دلخواه: روی یه عکس ریپلای کن و بزن <code>.ساعت_عکس عکس</code></blockquote>" + note)
+            "(موقع روشن کردن هم خودکار آخرین پروفایلت برداشته میشه). عکس دلخواه: روی یه عکس ریپلای کن و بزن <code>.ساعت_عکس عکس</code>\n🖼 سه طرح آخر («پوستر ۱۸|۱۹») روی خودِ عکس پوستر کشیده میشن، نه روی عکس پروفایلت.</blockquote>" + note)
     return text, rows
 
 
